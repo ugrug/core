@@ -200,6 +200,7 @@ FLOWS = [
     "metoffice",
     "mikrotik",
     "mill",
+    "min_max",
     "minecraft_server",
     "mjpeg",
     "mobile_app",
