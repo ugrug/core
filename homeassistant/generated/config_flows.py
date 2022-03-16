@@ -337,6 +337,7 @@ FLOWS = [
     "tesla_wall_connector",
     "tibber",
     "tile",
+    "tod",
     "tolo",
     "toon",
     "totalconnect",
