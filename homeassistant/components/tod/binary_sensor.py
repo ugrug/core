@@ -110,14 +110,15 @@ class TodSensor(BinarySensorEntity):
 
     def _naive_time_to_utc_datetime(self, naive_time):
         """Convert naive time from config to utc_datetime with current day."""
+        hass_time_zone = dt_util.get_time_zone(self.hass.config.time_zone)
         # get the current local date from utc time
-        current_local_date = (
-            dt_util.utcnow()
-            .astimezone(dt_util.get_time_zone(self.hass.config.time_zone))
-            .date()
-        )
+        current_local_date = dt_util.utcnow().astimezone(hass_time_zone).date()
         # calculate utc datetime corresponding to local time
-        return dt_util.as_utc(datetime.combine(current_local_date, naive_time))
+        local_datetime = datetime.combine(
+            current_local_date, naive_time, hass_time_zone
+        )
+        utc_datetime = dt_util.as_utc(local_datetime)
+        return utc_datetime
 
     def _calculate_boudary_time(self):
         """Calculate internal absolute time boundaries."""
