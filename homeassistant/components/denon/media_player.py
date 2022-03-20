@@ -25,6 +25,15 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
+#ugrug
+#for queue
+from homeassistant.helpers.event import track_time_interval
+from datetime import datetime, timedelta, timezone
+import asyncio
+from collections import deque
+import async_timeout
+#ugrug end
+
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_NAME = "Music station"
@@ -82,6 +91,9 @@ MEDIA_MODES = {
 # {'USB': 'USB', 'iPod Direct': 'IPD', 'Internet Radio': 'IRP',
 #  'Favorites': 'FVP'}
 
+UPDATE_INTERVAL = 1
+TELNET_CLOSE_TIMEOUT = 3
+TELNET_CLOSE_DELAY = 1
 
 def setup_platform(
     hass: HomeAssistant,
@@ -90,7 +102,7 @@ def setup_platform(
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
     """Set up the Denon platform."""
-    denon = DenonDevice(config[CONF_NAME], config[CONF_HOST])
+    denon = DenonDevice(hass, config[CONF_NAME], config[CONF_HOST])
 
     if denon.update():
         add_entities([denon])
@@ -99,8 +111,9 @@ def setup_platform(
 class DenonDevice(MediaPlayerEntity):
     """Representation of a Denon device."""
 
-    def __init__(self, name, host):
+    def __init__(self, hass, name, host):
         """Initialize the Denon device."""
+        self.hass = hass
         self._name = name
         self._host = host
         self._pwstate = "PWSTANDBY"
@@ -115,15 +128,35 @@ class DenonDevice(MediaPlayerEntity):
 
         self._should_setup_sources = True
 
-    def _setup_sources(self, telnet):
+        _LOGGER.info('Init ' + str(self.name) + ' [' + str(host) + ']')
+
+        self.telnet_progress_set = set()
+        self.telnet_progress = None
+        self.telnet_command_queue = deque()
+
+        self.telnet = None
+        self.telnet_is_open = False
+        self.telnet_last_active = None
+        self.telnet_last_error = None
+
+        self.first_update = True
+
+        self.executing_command = False
+        self.executing_update = False
+
+        track_time_interval(
+          self.hass, self.update_periodic, timedelta(seconds=UPDATE_INTERVAL)
+        )
+
+    def _setup_sources(self):
         # NSFRN - Network name
-        nsfrn = self.telnet_request(telnet, "NSFRN ?")[len("NSFRN ") :]
+        nsfrn = self.telnet_request("NSFRN ?")[len("NSFRN ") :]
         if nsfrn:
             self._name = nsfrn
 
         # SSFUN - Configured sources with (optional) names
         self._source_list = {}
-        for line in self.telnet_request(telnet, "SSFUN ?", all_lines=True):
+        for line in self.telnet_request("SSFUN ?", all_lines=True):
             ssfun = line[len("SSFUN") :].split(" ", 1)
 
             source = ssfun[0]
@@ -136,7 +169,7 @@ class DenonDevice(MediaPlayerEntity):
             self._source_list[configured_name] = source
 
         # SSSOD - Deleted sources
-        for line in self.telnet_request(telnet, "SSSOD ?", all_lines=True):
+        for line in self.telnet_request("SSSOD ?", all_lines=True):
             source, status = line[len("SSSOD") :].split(" ", 1)
             if status == "DEL":
                 for pretty_name, name in self._source_list.items():
@@ -147,15 +180,25 @@ class DenonDevice(MediaPlayerEntity):
     @classmethod
     def telnet_request(cls, telnet, command, all_lines=False):
         """Execute `command` and return the response."""
+
         _LOGGER.debug("Sending: %s", command)
-        telnet.write(command.encode("ASCII") + b"\r")
-        lines = []
-        while True:
+        try:
+          telnet.write(command.encode("ASCII") + b"\r")
+          lines = []
+          while True:
             line = telnet.read_until(b"\r", timeout=0.2)
             if not line:
-                break
+              break
             lines.append(line.decode("ASCII").strip())
             _LOGGER.debug("Received: %s", line)
+
+        except ConnectionResetError as e:
+          _LOGGER.error("ConnectionResetError, cannot request %s [%s]", command.encode("ASCII"), str(e))
+          return ""
+
+        except BrokenPipeError as e:
+          _LOGGER.error("BrokenPipeError, cannot request %s [%s]", command.encode("ASCII"), str(e))
+          return ""
 
         if all_lines:
             return lines
@@ -163,54 +206,197 @@ class DenonDevice(MediaPlayerEntity):
 
     def telnet_command(self, command):
         """Establish a telnet connection and sends `command`."""
-        telnet = telnetlib.Telnet(self._host)
-        _LOGGER.debug("Sending: %s", command)
-        telnet.write(command.encode("ASCII") + b"\r")
-        telnet.read_very_eager()  # skip response
-        telnet.close()
+        kwargs = {"command":command}
+        self.telnet_command_queue.append(kwargs)
+        self.telnet_progress_set.add("command")
+        if self.telnet_progress is None:
+          self.hass.add_job(self.async_task_process())
+
+    #ugrug
+    def telnet_open(self):
+        success = True
+        if not self.telnet_is_open:
+          success = False
+          try:
+            _LOGGER.debug("Telnet open")
+            self.telnet = telnetlib.Telnet(self._host)
+            self.telnet_is_open = True
+            success = True
+            self.telnet_last_active = datetime.now()
+            self.telnet_last_error = None
+          except OSError as e:
+            self.telnet_last_active = None
+            self.telnet_last_error = datetime.now()
+            _LOGGER.error("OSError: %s", str(e))
+          except:
+            self.telnet_last_active = None
+            self.telnet_last_error = datetime.now()
+            _LOGGER.error("Unknown error")
+        return success
+
+    def telnet_close(self):
+        success = True
+        if self.telnet_is_open:
+          success = False
+          try:
+            _LOGGER.debug("Telnet close")
+            self.telnet.close()
+            self.telnet = None
+            self.telnet_is_open = False
+            success = True
+          except OSError as e:
+            _LOGGER.error("OSError: %s", str(e))
+          except:
+            _LOGGER.error("Unknown error")
+          self.telnet_last_active = None
+          self.telnet_last_error = datetime.now()
+        return success
+
+    def telnet_command_execute(self, command):
+        """Establish a telnet connection and sends `command`."""
+        success = False
+        try:
+          _LOGGER.debug("Sending: %s", command)
+          progress = self.telnet_open()
+          if progress:
+            self.telnet.write(command.encode("ASCII") + b"\r")
+            self.telnet.read_very_eager()  # skip response
+            self.telnet_last_active = datetime.now()
+            self.telnet_last_error = None
+          success = progress
+        except OSError as e:
+          self.telnet_last_active = None
+          self.telnet_last_error = datetime.now()
+          _LOGGER.error("OSError: %s [%s]", command, str(e))
+        except:
+          self.telnet_last_active = None
+          self.telnet_last_error = datetime.now()
+          _LOGGER.error("Unknown error: %s", command)
+        self.executing_command = False
+        return success
+
+    def update_periodic(self, now):
+        if self.telnet_progress is not None:
+          return
+        if len(self.telnet_progress_set):
+          self.hass.add_job(self.async_task_process())
+        else:
+          if (self.telnet_last_active is None) or \
+            ((not (self.telnet_last_active is None)) and ((datetime.now() - self.telnet_last_active).total_seconds() >= TELNET_CLOSE_TIMEOUT)):
+              self.telnet_close()
 
     def update(self):
-        """Get the latest details from the device."""
-        try:
-            telnet = telnetlib.Telnet(self._host)
-        except OSError:
-            return False
-
-        if self._should_setup_sources:
-            self._setup_sources(telnet)
-            self._should_setup_sources = False
-
-        self._pwstate = self.telnet_request(telnet, "PW?")
-        for line in self.telnet_request(telnet, "MV?", all_lines=True):
-            if line.startswith("MVMAX "):
-                # only grab two digit max, don't care about any half digit
-                self._volume_max = int(line[len("MVMAX ") : len("MVMAX XX")])
-                continue
-            if line.startswith("MV"):
-                self._volume = int(line[len("MV") :])
-        self._muted = self.telnet_request(telnet, "MU?") == "MUON"
-        self._mediasource = self.telnet_request(telnet, "SI?")[len("SI") :]
-
-        if self._mediasource in MEDIA_MODES.values():
-            self._mediainfo = ""
-            answer_codes = [
-                "NSE0",
-                "NSE1X",
-                "NSE2X",
-                "NSE3X",
-                "NSE4",
-                "NSE5",
-                "NSE6",
-                "NSE7",
-                "NSE8",
-            ]
-            for line in self.telnet_request(telnet, "NSE", all_lines=True):
-                self._mediainfo += f"{line[len(answer_codes.pop(0)) :]}\n"
+        if self.first_update:
+          self.first_update = False
+          success = self.update_execute()
+          return success
         else:
-            self._mediainfo = self.source
+          self.telnet_progress_set.add('update')
+          if self.telnet_progress is None:
+            self.hass.add_job(self.async_task_process())
 
-        telnet.close()
-        return True
+    def update_execute(self):
+        """Get the latest details from the device."""
+        success = False
+        try:
+            progress = self.telnet_open()
+            if progress:
+
+                if self._should_setup_sources:
+                    self._setup_sources()
+                    self._should_setup_sources = False
+
+                self._pwstate = self.telnet_request("PW?")
+                for line in self.telnet_request("MV?", all_lines=True):
+                    if line.startswith("MVMAX "):
+                        # only grab two digit max, don't care about any half digit
+                        self._volume_max = int(line[len("MVMAX ") : len("MVMAX XX")])
+                        continue
+                    if line.startswith("MV"):
+                        self._volume = int(line[len("MV") :])
+                self._muted = self.telnet_request("MU?") == "MUON"
+                self._mediasource = self.telnet_request("SI?")[len("SI") :]
+
+                if self._mediasource in MEDIA_MODES.values():
+                    self._mediainfo = ""
+                    answer_codes = [
+                        "NSE0",
+                        "NSE1X",
+                        "NSE2X",
+                        "NSE3X",
+                        "NSE4",
+                        "NSE5",
+                        "NSE6",
+                        "NSE7",
+                        "NSE8",
+                    ]
+                    for line in self.telnet_request("NSE", all_lines=True):
+                        self._mediainfo += f"{line[len(answer_codes.pop(0)) :]}\n"
+                else:
+                    self._mediainfo = self.source
+
+                self.telnet_last_active = datetime.now()
+
+            success = progress
+        except OSError as e:
+            self.telnet_last_active = None
+            _LOGGER.error("OSError, Error during update %s", str(e))
+        except:
+            self.telnet_last_active = None
+            _LOGGER.error("Unknown error")
+        self.executing_update = False
+        return success
+
+    async def async_task_process(self):
+        if self.telnet_progress is not None:
+          return
+        if ((not (self.telnet_last_error is None)) and ((datetime.now() - self.telnet_last_error).total_seconds() < TELNET_CLOSE_DELAY)):
+          return
+        lock = asyncio.Lock()
+        async with lock:
+          self.telnet_progress = True
+          finished = False
+          error = False
+          kwargs = None
+          try:
+            with async_timeout.timeout(5):
+              while (not finished) and (not error):
+                if "update" in self.telnet_progress_set:
+                  self.executing_update = True
+                  success = await self.hass.async_add_executor_job(self.update_execute)
+                  while self.executing_update:
+                    time.sleep(0.1)
+                  if success:
+                    self.telnet_progress_set.remove("update")
+                  else:
+                    error = True
+                if "command" in self.telnet_progress_set:
+                  if len(self.telnet_command_queue) > 0:
+                    kwargs = self.telnet_command_queue.popleft()
+                    command = kwargs["command"]
+                    self.executing_command = True
+                    success = await self.hass.async_add_executor_job(self.telnet_command_execute, command)
+                    while self.executing_command:
+                      time.sleep(0.1)
+                    if success:
+                      kwargs = None
+                    else:
+                      error = True
+                  if len(self.telnet_command_queue) == 0:
+                    self.telnet_progress_set.remove("command")
+                if len(self.telnet_progress_set) == 0:
+                  finished = True
+          except asyncio.TimeoutError:
+            _LOGGER.error("Timeout")
+          except Exception as e:
+            _LOGGER.error("Error " + str(e) + " [" + str(type(e)) + "]")
+          except:
+            _LOGGER.error("Unknown error")
+          finally:
+            if kwargs is not None:
+              self.telnet_command_queue.appendleft(kwargs)
+            self.telnet_progress = None
+        return
 
     @property
     def name(self):
