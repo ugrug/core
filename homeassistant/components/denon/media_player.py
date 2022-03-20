@@ -150,13 +150,13 @@ class DenonDevice(MediaPlayerEntity):
 
     def _setup_sources(self):
         # NSFRN - Network name
-        nsfrn = self.telnet_request("NSFRN ?")[len("NSFRN ") :]
+        nsfrn = self.telnet_request(self.telnet, "NSFRN ?")[len("NSFRN ") :]
         if nsfrn:
             self._name = nsfrn
 
         # SSFUN - Configured sources with (optional) names
         self._source_list = {}
-        for line in self.telnet_request("SSFUN ?", all_lines=True):
+        for line in self.telnet_request(self.telnet, "SSFUN ?", all_lines=True):
             ssfun = line[len("SSFUN") :].split(" ", 1)
 
             source = ssfun[0]
@@ -169,7 +169,7 @@ class DenonDevice(MediaPlayerEntity):
             self._source_list[configured_name] = source
 
         # SSSOD - Deleted sources
-        for line in self.telnet_request("SSSOD ?", all_lines=True):
+        for line in self.telnet_request(self.telnet, "SSSOD ?", all_lines=True):
             source, status = line[len("SSSOD") :].split(" ", 1)
             if status == "DEL":
                 for pretty_name, name in self._source_list.items():
@@ -306,16 +306,16 @@ class DenonDevice(MediaPlayerEntity):
                     self._setup_sources()
                     self._should_setup_sources = False
 
-                self._pwstate = self.telnet_request("PW?")
-                for line in self.telnet_request("MV?", all_lines=True):
+                self._pwstate = self.telnet_request(self.telnet, "PW?")
+                for line in self.telnet_request(self.telnet, "MV?", all_lines=True):
                     if line.startswith("MVMAX "):
                         # only grab two digit max, don't care about any half digit
                         self._volume_max = int(line[len("MVMAX ") : len("MVMAX XX")])
                         continue
                     if line.startswith("MV"):
                         self._volume = int(line[len("MV") :])
-                self._muted = self.telnet_request("MU?") == "MUON"
-                self._mediasource = self.telnet_request("SI?")[len("SI") :]
+                self._muted = self.telnet_request(self.telnet, "MU?") == "MUON"
+                self._mediasource = self.telnet_request(self.telnet, "SI?")[len("SI") :]
 
                 if self._mediasource in MEDIA_MODES.values():
                     self._mediainfo = ""
@@ -330,7 +330,7 @@ class DenonDevice(MediaPlayerEntity):
                         "NSE7",
                         "NSE8",
                     ]
-                    for line in self.telnet_request("NSE", all_lines=True):
+                    for line in self.telnet_request(self.telnet, "NSE", all_lines=True):
                         self._mediainfo += f"{line[len(answer_codes.pop(0)) :]}\n"
                 else:
                     self._mediainfo = self.source
